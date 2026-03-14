@@ -5,62 +5,113 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace WilcomClipboardTool
 {
     class Program
     {
+        [DllImport("user32.dll")]
+        public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vlc);
+
+        [DllImport("user32.dll")]
+        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+        [DllImport("user32.dll")]
+        public static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
+        [DllImport("user32.dll")]
+        public static extern bool TranslateMessage(ref MSG lpMsg);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr DispatchMessage(ref MSG lpMsg);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSG
+        {
+            public IntPtr hwnd;
+            public uint message;
+            public IntPtr wParam;
+            public IntPtr lParam;
+            public uint time;
+            public POINT pt;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT
+        {
+            public int x;
+            public int y;
+        }
+
+        const int MOD_ALT = 0x0001;
+        const int MOD_CONTROL = 0x0002;
+        const int MOD_SHIFT = 0x0004;
+        const int MOD_WIN = 0x0008;
+        const int WM_HOTKEY = 0x0312;
+        const int HOTKEY_ID = 1;
+        const int VK_K = 0x4B;
+
+        [STAThread]
         static void Main(string[] args)
         {
-            Console.WriteLine("=============================================");
-            Console.WriteLine(" Wilcom Clipboard Transfer Tool");
-            Console.WriteLine("=============================================\n");
-
-            Console.WriteLine("Choose an action:");
-            Console.WriteLine("1. Save current Wilcom clipboard data to file");
-            Console.WriteLine("2. Load Wilcom clipboard data from file and paste to clipboard");
-            Console.Write("Action (1/2): ");
-            var choice = Console.ReadLine();
-
-            string defaultFilePath = "WilcomClipboardData.json";
-
-            if (choice == "1")
+            if (!RegisterHotKey(IntPtr.Zero, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_K))
             {
-                SaveClipboardToFile(defaultFilePath);
+                // Failed to register hotkey. App will exit.
+                return;
             }
-            else if (choice == "2")
+
+            MSG msg;
+            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
             {
-                LoadClipboardFromFile(defaultFilePath);
+                if (msg.message == WM_HOTKEY && msg.wParam.ToInt32() == HOTKEY_ID)
+                {
+                    HandleHotKey();
+                }
+
+                TranslateMessage(ref msg);
+                DispatchMessage(ref msg);
             }
-            else
+
+            UnregisterHotKey(IntPtr.Zero, HOTKEY_ID);
+        }
+
+        static void HandleHotKey()
+        {
+            try
             {
-                Console.WriteLine("Invalid choice.");
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string defaultFilePath = $"WilcomClipboardData_{timestamp}.json";
+                string hashFilePath = $"WilcomClipboardData_{timestamp}.sha256";
+
+                SaveClipboardToFileAndHash(defaultFilePath, hashFilePath);
+            }
+            catch (Exception ex)
+            {
+                // In a background app, we swallow exceptions or log them to a file.
+                File.AppendAllText("error.log", $"{DateTime.Now}: {ex.Message}{Environment.NewLine}");
             }
         }
 
-        static void SaveClipboardToFile(string filePath)
+        static void SaveClipboardToFileAndHash(string filePath, string hashFilePath)
         {
-            // Scan clipboard formats
             var formats = ClipboardHelper.GetClipboardFormats();
             var customFormats = formats.Where(f => f.Id >= 0xC000).ToList();
 
             if (!customFormats.Any())
             {
-                Console.WriteLine("\nNo custom clipboard formats found. Please copy something in Wilcom first.");
                 return;
             }
 
-            Console.WriteLine("\nFound Custom Formats (potentially Wilcom):");
             List<ClipboardDataExport> exportList = new List<ClipboardDataExport>();
 
             foreach (var customFormat in customFormats)
             {
-                Console.WriteLine($"Reading Data for Format: {customFormat.Name} ({customFormat.Id})");
                 byte[]? data = ClipboardHelper.GetClipboardDataBytes(customFormat.Id);
                 
                 if (data != null && data.Length > 0)
                 {
-                    Console.WriteLine($" => Successfully read {data.Length} bytes.");
                     exportList.Add(new ClipboardDataExport { FormatName = customFormat.Name, Data = data });
                 }
             }
@@ -69,66 +120,19 @@ namespace WilcomClipboardTool
             {
                 string json = JsonSerializer.Serialize(exportList, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(filePath, json);
-                Console.WriteLine($"\nSuccessfully saved {exportList.Count} formats to '{filePath}'");
-                Console.WriteLine("You can now transfer this file to another machine.");
-            }
-            else
-            {
-                Console.WriteLine("\nNo valid data could be read from the clipboard.");
-            }
 
-            Console.WriteLine("\nPress any key to exit...");
-            Console.ReadKey();
-        }
-
-        static void LoadClipboardFromFile(string filePath)
-        {
-            if (!File.Exists(filePath))
-            {
-                Console.WriteLine($"\nFile not found: {filePath}");
-                return;
-            }
-
-            Console.WriteLine($"\nLoading data from {filePath}...");
-            string json = File.ReadAllText(filePath);
-            var importList = JsonSerializer.Deserialize<List<ClipboardDataExport>>(json);
-
-            if (importList == null || !importList.Any())
-            {
-                Console.WriteLine("No data found in the file.");
-                return;
-            }
-
-            List<ClipboardHelper.ClipboardData> restoreList = new List<ClipboardHelper.ClipboardData>();
-
-            foreach (var item in importList)
-            {
-                // Register the format by name to get the correct dynamic ID for THIS machine
-                uint formatId = ClipboardHelper.RegisterClipboardFormat(item.FormatName);
-                if (formatId == 0)
+                // Compute SHA-256 hash of the JSON string
+                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+                using (SHA256 sha256 = SHA256.Create())
                 {
-                    Console.WriteLine($"Failed to register format: {item.FormatName}");
-                    continue;
+                    byte[] hashBytes = sha256.ComputeHash(jsonBytes);
+                    string hashString = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+                    File.WriteAllText(hashFilePath, hashString);
                 }
 
-                Console.WriteLine($"Registered format '{item.FormatName}' to local ID: {formatId}");
-                restoreList.Add(new ClipboardHelper.ClipboardData 
-                { 
-                    FormatId = formatId, 
-                    Data = item.Data 
-                });
-            }
-
-            Console.WriteLine("\nClearing and restoring data to clipboard...");
-            bool success = ClipboardHelper.SetMultipleClipboardData(restoreList);
-            
-            if (success)
-            {
-                Console.WriteLine("Data successfully restored to clipboard! You can now paste in Wilcom.");
-            }
-            else
-            {
-                Console.WriteLine("Failed to restore clipboard data.");
+                new ToastContentBuilder()
+                    .AddText("Design uploaded!")
+                    .Show();
             }
         }
     }
