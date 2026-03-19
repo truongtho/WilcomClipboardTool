@@ -7,77 +7,103 @@ using System.Text;
 using System.Text.Json;
 using System.Security.Cryptography;
 using Microsoft.Toolkit.Uwp.Notifications;
+using Microsoft.Win32;
+using System.Text.RegularExpressions;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace WilcomClipboardTool
 {
     class Program
     {
-        [DllImport("user32.dll")]
-        public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vlc);
 
-        [DllImport("user32.dll")]
-        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-
-        [DllImport("user32.dll")]
-        public static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
-
-        [DllImport("user32.dll")]
-        public static extern bool TranslateMessage(ref MSG lpMsg);
-
-        [DllImport("user32.dll")]
-        public static extern IntPtr DispatchMessage(ref MSG lpMsg);
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct MSG
-        {
-            public IntPtr hwnd;
-            public uint message;
-            public IntPtr wParam;
-            public IntPtr lParam;
-            public uint time;
-            public POINT pt;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct POINT
-        {
-            public int x;
-            public int y;
-        }
-
-        const int MOD_ALT = 0x0001;
-        const int MOD_CONTROL = 0x0002;
-        const int MOD_SHIFT = 0x0004;
-        const int MOD_WIN = 0x0008;
-        const int WM_HOTKEY = 0x0312;
-        const int HOTKEY_ID = 1;
-        const int VK_K = 0x4B;
 
         [STAThread]
         static void Main(string[] args)
         {
-            if (!RegisterHotKey(IntPtr.Zero, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_K))
+            Application.SetHighDpiMode(HighDpiMode.SystemAware);
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            bool isFirstInstance;
+            Mutex appMutex = new Mutex(true, "WilcomClipboardTool_SingleInstance", out isFirstInstance);
+
+            // Listen to toast popup button clicks
+            ToastNotificationManagerCompat.OnActivated += toastArgs =>
             {
-                // Failed to register hotkey. App will exit.
+                ToastArguments argsDict = ToastArguments.Parse(toastArgs.Argument);
+                if (argsDict.Contains("action") && argsDict["action"] == "copyCode" && argsDict.Contains("userCode"))
+                {
+                    // Must be invoked on STA thread
+                    if (System.Windows.Forms.Application.OpenForms.Count > 0)
+                    {
+                        System.Windows.Forms.Application.OpenForms[0].Invoke(new Action(() => 
+                        {
+                            Clipboard.SetText(argsDict["userCode"]);
+                        }));
+                    }
+                }
+            };
+
+            RegisterUriScheme();
+
+            // When run from Windows or Browser, the URI might be split into multiple args or wrapped in quotes.
+            string fullArgs = string.Join(" ", args);
+            bool handledUri = false;
+            if (fullArgs.Contains("wilcom://", StringComparison.OrdinalIgnoreCase))
+            {
+                var match = Regex.Match(fullArgs, @"wilcom://\S+", RegexOptions.IgnoreCase);
+                if (match.Success)
+                {
+                    HandleUriInvocation(match.Value).GetAwaiter().GetResult();
+                    handledUri = true;
+                    
+                    // If a tray app is ALREADY running, this short-lived instance just exits now.
+                    // If this is the FIRST instance, we want it to stay alive in the tray!
+                    if (!isFirstInstance)
+                    {
+                        return; // Exit after handling URI as a secondary process
+                    }
+                }
+            }
+
+            // If we get here and it's NOT the first instance (e.g. user double-clicked the exe again manually)
+            if (!isFirstInstance)
+            {
+                MessageBox.Show("Wilcom Clipboard Tool is already running in the system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
-            MSG msg;
-            while (GetMessage(out msg, IntPtr.Zero, 0, 0) > 0)
+            var oauthManager = new DesktopOAuthManager();
+            var trayContext = new TrayApplicationContext(oauthManager);
+            
+            // Wire up event to refresh UI
+            oauthManager.OnAuthStatusChanged += (s, e) =>
             {
-                if (msg.message == WM_HOTKEY && msg.wParam.ToInt32() == HOTKEY_ID)
+                // Ensure UI updates happen on main thread
+                if (System.Windows.Forms.Application.OpenForms.Count > 0)
                 {
-                    HandleHotKey();
+                    System.Windows.Forms.Application.OpenForms[0].Invoke(new Action(() => trayContext.UpdateStatus()));
                 }
+                else
+                {
+                    trayContext.UpdateStatus();
+                }
+            };
 
-                TranslateMessage(ref msg);
-                DispatchMessage(ref msg);
-            }
+            // Start polling async
+            _ = oauthManager.GetAccessTokenAsync();
 
-            UnregisterHotKey(IntPtr.Zero, HOTKEY_ID);
+            Application.Run(trayContext);
+
+            // Keep Mutex alive until app exits explicitly
+            GC.KeepAlive(appMutex);
         }
 
-        static void HandleHotKey()
+        public static void HandleHotKey()
         {
             try
             {
@@ -133,6 +159,158 @@ namespace WilcomClipboardTool
                 new ToastContentBuilder()
                     .AddText("Design uploaded!")
                     .Show();
+            }
+        }
+
+        static string GetLogPath(string filename)
+        {
+            return Path.Combine(AppContext.BaseDirectory, filename);
+        }
+
+        static void RegisterUriScheme()
+        {
+            try
+            {
+                string scheme = "wilcom";
+                // System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName often points to dotnet.exe during 'dotnet run'
+                string executablePath = Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
+                
+                // If running via 'dotnet run', we want to register the compiled .exe, not dotnet.exe
+                if (executablePath.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Fallback for dotnet run: assume the .dll path just needs .exe
+                    executablePath = System.Reflection.Assembly.GetExecutingAssembly().Location.Replace(".dll", ".exe");
+                }
+
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{scheme}"))
+                {
+                    key.SetValue("", $"URL:{scheme} Protocol");
+                    key.SetValue("URL Protocol", "");
+
+                    using (RegistryKey defaultIcon = key.CreateSubKey("DefaultIcon"))
+                    {
+                        defaultIcon.SetValue("", $"{executablePath},1");
+                    }
+
+                    using (RegistryKey commandKey = key.CreateSubKey(@"shell\open\command"))
+                    {
+                        commandKey.SetValue("", $"\"{executablePath}\" \"%1\"");
+                    }
+                }
+                
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Successfully registered URI scheme '{scheme}' to point to {executablePath}\n");
+            }
+            catch (Exception ex)
+            {
+                File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: Failed to register URI scheme - {ex.Message}{Environment.NewLine}");
+            }
+        }
+
+        static async Task HandleUriInvocation(string uri)
+        {
+            try
+            {
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: HandleUriInvocation called with URI: {uri}\n");
+                
+                string payload = uri.Replace("wilcom://", "", StringComparison.OrdinalIgnoreCase).Trim('/');
+                
+                if (string.IsNullOrEmpty(payload)) 
+                {
+                    File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Payload was empty after processing.\n");
+                    return;
+                }
+
+                string apiUrl = payload.StartsWith("http", StringComparison.OrdinalIgnoreCase) 
+                                ? payload 
+                                : $"https://localhost:7178/api/WilcomClipboards/{payload}";
+
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Constructed API URL: {apiUrl}\n");
+
+                using HttpClient client = new HttpClient();
+                
+                var handler = new HttpClientHandler
+                {
+                    ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
+                };
+                client.CancelPendingRequests();
+                client.Dispose();
+                
+                using HttpClient devClient = new HttpClient(handler);
+                devClient.Timeout = TimeSpan.FromSeconds(15);
+                
+                var oauthManager = new DesktopOAuthManager();
+                string? token = oauthManager.GetStoredAccessToken();
+                
+                if (!string.IsNullOrEmpty(token))
+                {
+                    devClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                }
+                
+                var response = await devClient.GetAsync(apiUrl);
+                
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: API Response Status: {(int)response.StatusCode} {response.StatusCode}\n");
+
+                if (response.IsSuccessStatusCode)
+                {
+                    string jsonResponse = await response.Content.ReadAsStringAsync();
+                    
+                    using JsonDocument document = JsonDocument.Parse(jsonResponse);
+                    if (document.RootElement.TryGetProperty("wilcomObjectJson", out JsonElement jsonElement))
+                    {
+                        string wilcomObjectJson = jsonElement.GetString() ?? "";
+
+                        var exportList = JsonSerializer.Deserialize<List<ClipboardDataExport>>(wilcomObjectJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                        
+                        if (exportList != null && exportList.Any())
+                        {
+                            var clipboardDataList = new List<ClipboardHelper.ClipboardData>();
+                            foreach (var export in exportList)
+                            {
+                                uint formatId = ClipboardHelper.RegisterClipboardFormat(export.FormatName);
+                                if (formatId > 0 && export.Data != null && export.Data.Length > 0)
+                                {
+                                    clipboardDataList.Add(new ClipboardHelper.ClipboardData
+                                    {
+                                        FormatId = formatId,
+                                        Data = export.Data
+                                    });
+                                }
+                            }
+
+                            if (ClipboardHelper.SetMultipleClipboardData(clipboardDataList))
+                            {
+                                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Clipboard data set successfully. Showing toast.\n");
+                                new ToastContentBuilder()
+                                    .AddText("Design copied! Paste in Wilcom with Ctrl+V.")
+                                    .Show(toast =>
+                                    {
+                                        toast.ExpirationTime = DateTime.Now.AddSeconds(5);
+                                    });
+                                
+                                // Keep the hidden win32 process alive for 6 seconds so the Toast Notification isn't killed
+                                await Task.Delay(6000); 
+                            }
+                            else
+                            {
+                                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: SetMultipleClipboardData returned false.\n");
+                            }
+                        }
+                    }
+                    else
+                    {
+                         File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: 'wilcomObjectJson' property missing in API response.\n");
+                    }
+                }
+                else
+                {
+                    string errorResponse = await response.Content.ReadAsStringAsync();
+                    File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: API call failed with response: {errorResponse}\n");
+                }
+            }
+            catch (Exception ex)
+            {
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Exception thrown inside HandleUriInvocation: {ex.Message}{Environment.NewLine}{ex.StackTrace}\n");
+                File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: URI Invocation Error - {ex.Message}{Environment.NewLine}");
             }
         }
     }
