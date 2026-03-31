@@ -14,7 +14,6 @@ namespace SMSDesignAgent
         private ToolStripMenuItem _statusMenuItem;
         private ToolStripMenuItem _copyCodeMenuItem;
         private ToolStripMenuItem _checkUpdateMenuItem;
-        private ToolStripMenuItem _autoStartMenuItem;
         
         // HotKey Win32 constants
         public const int WM_HOTKEY = 0x0312;
@@ -46,9 +45,7 @@ namespace SMSDesignAgent
             string versionStr = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0.0";
             var versionMenuItem = new ToolStripMenuItem($"Version {versionStr}");
             versionMenuItem.Enabled = false;
-
-            _autoStartMenuItem = new ToolStripMenuItem("Run when Windows starts", null, AutoStart_Click);
-            _autoStartMenuItem.Checked = IsAutoStartEnabled();
+            InitializeAutoStartDefault();
 
             var exitMenuItem = new ToolStripMenuItem("Exit", null, Exit_Click);
 
@@ -61,12 +58,10 @@ namespace SMSDesignAgent
             };
 
             _trayIcon.ContextMenuStrip.Items.Add(_statusMenuItem);
-            _trayIcon.ContextMenuStrip.Items.Add(_copyCodeMenuItem);
-            _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-            _trayIcon.ContextMenuStrip.Items.Add(_checkUpdateMenuItem);
             _trayIcon.ContextMenuStrip.Items.Add(versionMenuItem);
             _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
-            _trayIcon.ContextMenuStrip.Items.Add(_autoStartMenuItem);
+            _trayIcon.ContextMenuStrip.Items.Add(_copyCodeMenuItem);
+            _trayIcon.ContextMenuStrip.Items.Add(_checkUpdateMenuItem);
             _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
             _trayIcon.ContextMenuStrip.Items.Add(exitMenuItem);
 
@@ -140,6 +135,24 @@ namespace SMSDesignAgent
 
         private const string RunKeyName = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string AppName = "SMSDesignAgent";
+        private const string AppSettingsKey = @"Software\SMSDesignAgent";
+
+        private void InitializeAutoStartDefault()
+        {
+            using (RegistryKey? key = Registry.CurrentUser.CreateSubKey(AppSettingsKey))
+            {
+                if (key != null)
+                {
+                    object? initFlag = key.GetValue("AutoStartInitialized");
+                    if (initFlag == null)
+                    {
+                        // Enable auto start on very first run
+                        SetAutoStart(true);
+                        key.SetValue("AutoStartInitialized", 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+        }
 
         private bool IsAutoStartEnabled()
         {
@@ -151,13 +164,6 @@ namespace SMSDesignAgent
                 }
             }
             return false;
-        }
-
-        private void AutoStart_Click(object? sender, EventArgs e)
-        {
-            bool isEnabled = IsAutoStartEnabled();
-            SetAutoStart(!isEnabled);
-            _autoStartMenuItem.Checked = !isEnabled;
         }
 
         private void SetAutoStart(bool enable)
