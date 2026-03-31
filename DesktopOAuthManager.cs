@@ -7,15 +7,18 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Microsoft.Toolkit.Uwp.Notifications;
+using System.Xml.Linq;
 using Microsoft.Win32;
+using System.Reflection;
+using System.Collections.Generic;
+using Microsoft.Toolkit.Uwp.Notifications;
 
-namespace WilcomClipboardTool
+namespace SMSDesignAgent
 {
     public class DesktopOAuthManager
     {
-        private const string ApiBaseUrl = "https://localhost:7178/api/DeviceAuth";
-        private const string RegistryPath = @"Software\Desify\WilcomClipboardTool";
+        private string ApiBaseUrl => AppConfig.DeviceAuthApiUrl;
+        private const string RegistryPath = @"Software\Desify\SMSDesignAgent";
 
         public class DeviceTokenResponse
         {
@@ -57,13 +60,18 @@ namespace WilcomClipboardTool
                 }
                 
                 LogTrace("Silent refresh unavailable or failed. Generating new Device Flow.");
-                DeleteRegistryValue("AccessToken");
-                DeleteRegistryValue("RefreshToken");
+                ClearTokens();
             }
 
             // No token or expired, start Auth Flow
             await StartAuthorizationFlow();
             return null; // The process is asynchronous and polling, token won't be ready immediately
+        }
+
+        public void ClearTokens()
+        {
+            DeleteRegistryValue("AccessToken");
+            DeleteRegistryValue("RefreshToken");
         }
 
         private bool IsTokenExpired(string jwt)
@@ -152,7 +160,17 @@ namespace WilcomClipboardTool
 
             try
             {
-                var codeRequest = new { DeviceFingerprint = fingerprint, MachineName = machineName };
+                var currentVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0";
+                var appMetadata = new Dictionary<string, string>
+                {
+                    { "SmsDesignAgent", currentVersion }
+                };
+
+                var codeRequest = new { 
+                    DeviceFingerprint = fingerprint, 
+                    MachineName = machineName,
+                    AppMetadata = appMetadata
+                };
                 var response = await client.PostAsJsonAsync($"{ApiBaseUrl}/device-code", codeRequest);
                 
                 if (response.IsSuccessStatusCode)
@@ -164,7 +182,7 @@ namespace WilcomClipboardTool
                         OnAuthStatusChanged?.Invoke(this, EventArgs.Empty);
 
                         // Open Browser
-                        OpenBrowser("http://localhost:4200/device-auth");
+                        OpenBrowser(AppConfig.DeviceAuthFrontendUrl);
                         
                         // Show Toast with Code
                         new ToastContentBuilder()

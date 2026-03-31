@@ -10,13 +10,58 @@ using Microsoft.Toolkit.Uwp.Notifications;
 using Microsoft.Win32;
 using System.Text.RegularExpressions;
 using System.Net.Http;
+using System.Net.Http.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using Microsoft.Toolkit.Uwp.Notifications;
 
-namespace WilcomClipboardTool
+namespace SMSDesignAgent
 {
+    public static class AppConfig
+    {
+        public static string DesignLibraryApiUrl { get; set; } = "https://sms-api.mbczone.com/api/DesignLibrary/";
+        public static string DeviceAuthApiUrl { get; set; } = "https://sms-api.mbczone.com/api/DeviceAuth";
+        public static string DeviceAuthFrontendUrl { get; set; } = "https://sms.mbczone.com/device-auth";
+        public static string ApplicationReleaseApiUrl => DeviceAuthApiUrl.Replace("/DeviceAuth", "/ApplicationRelease", StringComparison.OrdinalIgnoreCase);
+
+        static AppConfig()
+        {
+            string configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+            if (File.Exists(configPath))
+            {
+                try
+                {
+                    string json = File.ReadAllText(configPath);
+                    var doc = JsonDocument.Parse(json);
+                    
+                    if (doc.RootElement.TryGetProperty("DesignLibraryApiUrl", out var clipboardProp))
+                        DesignLibraryApiUrl = clipboardProp.GetString() ?? DesignLibraryApiUrl;
+                        
+                    if (doc.RootElement.TryGetProperty("DeviceAuthApiUrl", out var authProp))
+                        DeviceAuthApiUrl = authProp.GetString() ?? DeviceAuthApiUrl;
+                        
+                    if (doc.RootElement.TryGetProperty("DeviceAuthFrontendUrl", out var frontendProp))
+                        DeviceAuthFrontendUrl = frontendProp.GetString() ?? DeviceAuthFrontendUrl;
+                }
+                catch { }
+            }
+            else
+            {
+                try
+                {
+                    var defaultConfig = new
+                    {
+                        DesignLibraryApiUrl = DesignLibraryApiUrl,
+                        DeviceAuthApiUrl = DeviceAuthApiUrl,
+                        DeviceAuthFrontendUrl = DeviceAuthFrontendUrl
+                    };
+                    File.WriteAllText(configPath, JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true }));
+                }
+                catch { }
+            }
+        }
+    }
+
     class Program
     {
 
@@ -29,7 +74,7 @@ namespace WilcomClipboardTool
             Application.SetCompatibleTextRenderingDefault(false);
 
             bool isFirstInstance;
-            Mutex appMutex = new Mutex(true, "WilcomClipboardTool_SingleInstance", out isFirstInstance);
+            Mutex appMutex = new Mutex(true, "SMSDesignAgent_SingleInstance", out isFirstInstance);
 
             // Listen to toast popup button clicks
             ToastNotificationManagerCompat.OnActivated += toastArgs =>
@@ -37,14 +82,19 @@ namespace WilcomClipboardTool
                 ToastArguments argsDict = ToastArguments.Parse(toastArgs.Argument);
                 if (argsDict.Contains("action") && argsDict["action"] == "copyCode" && argsDict.Contains("userCode"))
                 {
-                    // Must be invoked on STA thread
-                    if (System.Windows.Forms.Application.OpenForms.Count > 0)
+                    Thread thread = new Thread(() =>
                     {
-                        System.Windows.Forms.Application.OpenForms[0].Invoke(new Action(() => 
-                        {
-                            Clipboard.SetText(argsDict["userCode"]);
-                        }));
-                    }
+                        try { Clipboard.SetText(argsDict["userCode"]); } catch { }
+                    });
+                    thread.SetApartmentState(ApartmentState.STA);
+                    thread.Start();
+                    thread.Join();
+                }
+                else if (argsDict.Contains("action") && argsDict["action"] == "updateApp" && argsDict.Contains("downloadUrl"))
+                {
+                    string downloadUrl = argsDict["downloadUrl"];
+                    string downloadApiUrl = $"{AppConfig.ApplicationReleaseApiUrl}/latest/SmsDesignAgent/download";
+                    Task.Run(async () => await UpdateManager.DownloadAndInstallUpdateAsync(downloadApiUrl, downloadUrl));
                 }
             };
 
@@ -53,9 +103,9 @@ namespace WilcomClipboardTool
             // When run from Windows or Browser, the URI might be split into multiple args or wrapped in quotes.
             string fullArgs = string.Join(" ", args);
             bool handledUri = false;
-            if (fullArgs.Contains("wilcom://", StringComparison.OrdinalIgnoreCase))
+            if (fullArgs.Contains("sms-design-agent://", StringComparison.OrdinalIgnoreCase))
             {
-                var match = Regex.Match(fullArgs, @"wilcom://\S+", RegexOptions.IgnoreCase);
+                var match = Regex.Match(fullArgs, @"sms-design-agent://\S+", RegexOptions.IgnoreCase);
                 if (match.Success)
                 {
                     HandleUriInvocation(match.Value).GetAwaiter().GetResult();
@@ -73,7 +123,7 @@ namespace WilcomClipboardTool
             // If we get here and it's NOT the first instance (e.g. user double-clicked the exe again manually)
             if (!isFirstInstance)
             {
-                MessageBox.Show("Wilcom Clipboard Tool is already running in the system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("SMS Design Agent is already running in the system tray.", "Already Running", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -97,38 +147,47 @@ namespace WilcomClipboardTool
             // Start polling async
             _ = oauthManager.GetAccessTokenAsync();
 
+            // Background async auto-update check
+            _ = UpdateManager.CheckForUpdatesAsync();
+
             Application.Run(trayContext);
 
             // Keep Mutex alive until app exits explicitly
             GC.KeepAlive(appMutex);
         }
 
-        public static void HandleHotKey()
+        public static async void HandleHotKey()
         {
             try
             {
-                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                string defaultFilePath = $"WilcomClipboardData_{timestamp}.json";
-                string hashFilePath = $"WilcomClipboardData_{timestamp}.sha256";
-
-                SaveClipboardToFileAndHash(defaultFilePath, hashFilePath);
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: HandleHotKey Triggered.\n");
+                await UploadClipboardToApiAsync();
             }
             catch (Exception ex)
             {
                 // In a background app, we swallow exceptions or log them to a file.
-                File.AppendAllText("error.log", $"{DateTime.Now}: {ex.Message}{Environment.NewLine}");
+                File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: {ex.Message}{Environment.NewLine}");
             }
         }
 
-        static void SaveClipboardToFileAndHash(string filePath, string hashFilePath)
+        static async Task UploadClipboardToApiAsync()
         {
             var formats = ClipboardHelper.GetClipboardFormats();
             var customFormats = formats.Where(f => f.Id >= 0xC000).ToList();
 
-            if (!customFormats.Any())
+            if (!formats.Any())
             {
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Clipboard is either empty or OpenClipboard failed immediately.\n");
                 return;
             }
+
+            if (!customFormats.Any())
+            {
+                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: No custom >0xC000 formats found. Only {formats.Count} basic formats exist.\n");
+                return;
+            }
+
+            File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Found {customFormats.Count} custom clipboard formats. Extracting...\n");
 
             List<ClipboardDataExport> exportList = new List<ClipboardDataExport>();
 
@@ -144,21 +203,97 @@ namespace WilcomClipboardTool
 
             if (exportList.Any())
             {
-                string json = JsonSerializer.Serialize(exportList, new JsonSerializerOptions { WriteIndented = true });
-                File.WriteAllText(filePath, json);
+                string json = JsonSerializer.Serialize(exportList, new JsonSerializerOptions { WriteIndented = false });
+                
+                using var sha256 = System.Security.Cryptography.SHA256.Create();
+                var hashBytes = sha256.ComputeHash(System.Text.Encoding.UTF8.GetBytes(json));
+                string hashString = Convert.ToHexString(hashBytes).ToLowerInvariant();
 
-                // Compute SHA-256 hash of the JSON string
-                byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
-                using (SHA256 sha256 = SHA256.Create())
+                var payload = new { hash = hashString, wilcomObjectJson = json };
+
+                var handler = new HttpClientHandler
                 {
-                    byte[] hashBytes = sha256.ComputeHash(jsonBytes);
-                    string hashString = BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
-                    File.WriteAllText(hashFilePath, hashString);
+                    ServerCertificateCustomValidationCallback = (sender, cert, chain, sslPolicyErrors) => true
+                };
+                
+                using HttpClient devClient = new HttpClient(handler);
+                devClient.Timeout = TimeSpan.FromSeconds(30);
+
+                var oauthManager = new DesktopOAuthManager();
+                string? token = await oauthManager.GetAccessTokenAsync();
+                
+                if (string.IsNullOrEmpty(token))
+                {
+                    // Flow kicked off, abort current silent operation
+                    return;
                 }
 
-                new ToastContentBuilder()
-                    .AddText("Design uploaded!")
-                    .Show();
+                devClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+
+                try 
+                {
+                    string familiesUrl = $"{AppConfig.DesignLibraryApiUrl.TrimEnd('/')}/families";
+                    var familyPayload = new { name = "Clipboard Upload " + DateTime.Now.ToString("g") };
+                    var familyResponse = await devClient.PostAsJsonAsync(familiesUrl, familyPayload);
+                    
+                    if (familyResponse.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                    {
+                        oauthManager.ClearTokens();
+                        await oauthManager.GetAccessTokenAsync();
+                        return;
+                    }
+
+                    if (familyResponse.IsSuccessStatusCode)
+                    {
+                        var familyResult = await familyResponse.Content.ReadFromJsonAsync<JsonElement>();
+                        string familyId = "";
+                        if (familyResult.TryGetProperty("id", out var idElement))
+                        {
+                            familyId = idElement.ToString();
+                        }
+
+                        if (!string.IsNullOrEmpty(familyId))
+                        {
+                            string variantsUrl = $"{familiesUrl}/{familyId}/variants";
+                            var variantPayload = new { wilcomObjectJson = json, sizeLabel = "Default", colorwayName = "Default" };
+                            var variantResponse = await devClient.PostAsJsonAsync(variantsUrl, variantPayload);
+
+                            if (variantResponse.IsSuccessStatusCode)
+                            {
+                                new ToastContentBuilder()
+                                    .AddText("Design uploaded!")
+                                    .AddText("Successfully saved to cloud.")
+                                    .Show();
+                            }
+                            else
+                            {
+                                string errorResponse = await variantResponse.Content.ReadAsStringAsync();
+                                File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: API Variant Upload failed with response: {errorResponse}\n");
+                                new ToastContentBuilder()
+                                    .AddText("Upload Failed")
+                                    .AddText($"Variant Status: {variantResponse.StatusCode}")
+                                    .Show();
+                            }
+                        }
+                    }
+                    else
+                    {
+                        string errorResponse = await familyResponse.Content.ReadAsStringAsync();
+                        File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: API Family Upload failed with response: {errorResponse}\n");
+                        new ToastContentBuilder()
+                            .AddText("Upload Failed")
+                            .AddText($"Family Status: {familyResponse.StatusCode}")
+                            .Show();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    File.AppendAllText(GetLogPath("error.log"), $"{DateTime.Now}: API Upload exception - {ex.Message}\n");
+                    new ToastContentBuilder()
+                        .AddText("Upload Failed")
+                        .AddText("An error occurred. Check error.log for details.")
+                        .Show();
+                }
             }
         }
 
@@ -171,7 +306,7 @@ namespace WilcomClipboardTool
         {
             try
             {
-                string scheme = "wilcom";
+                string scheme = "sms-design-agent";
                 // System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName often points to dotnet.exe during 'dotnet run'
                 string executablePath = Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
                 
@@ -211,8 +346,11 @@ namespace WilcomClipboardTool
             try
             {
                 File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: HandleUriInvocation called with URI: {uri}\n");
-                
-                string payload = uri.Replace("wilcom://", "", StringComparison.OrdinalIgnoreCase).Trim('/');
+                string payload = uri
+                    .Replace("sms-design-agent://", "", StringComparison.OrdinalIgnoreCase)
+                    .Replace("copy/?id=", "", StringComparison.OrdinalIgnoreCase)
+                    .Replace("copy?id=", "", StringComparison.OrdinalIgnoreCase)
+                    .Trim('/', '"', '\'', ' ');
                 
                 if (string.IsNullOrEmpty(payload)) 
                 {
@@ -222,7 +360,7 @@ namespace WilcomClipboardTool
 
                 string apiUrl = payload.StartsWith("http", StringComparison.OrdinalIgnoreCase) 
                                 ? payload 
-                                : $"https://localhost:7178/api/WilcomClipboards/{payload}";
+                                : $"{AppConfig.DesignLibraryApiUrl.TrimEnd('/')}/variants/{payload}";
 
                 File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Constructed API URL: {apiUrl}\n");
 
@@ -239,26 +377,58 @@ namespace WilcomClipboardTool
                 devClient.Timeout = TimeSpan.FromSeconds(15);
                 
                 var oauthManager = new DesktopOAuthManager();
-                string? token = oauthManager.GetStoredAccessToken();
+                string? token = await oauthManager.GetAccessTokenAsync();
                 
-                if (!string.IsNullOrEmpty(token))
+                if (string.IsNullOrEmpty(token))
                 {
-                    devClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                    return;
                 }
+                
+                devClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
                 
                 var response = await devClient.GetAsync(apiUrl);
                 
                 File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: API Response Status: {(int)response.StatusCode} {response.StatusCode}\n");
+
+                if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                {
+                    oauthManager.ClearTokens();
+                    await oauthManager.GetAccessTokenAsync();
+                    return;
+                }
 
                 if (response.IsSuccessStatusCode)
                 {
                     string jsonResponse = await response.Content.ReadAsStringAsync();
                     
                     using JsonDocument document = JsonDocument.Parse(jsonResponse);
-                    if (document.RootElement.TryGetProperty("wilcomObjectJson", out JsonElement jsonElement))
-                    {
-                        string wilcomObjectJson = jsonElement.GetString() ?? "";
+                    string? wilcomObjectJson = null;
 
+                    if (document.RootElement.TryGetProperty("blobPath", out JsonElement blobElement) && blobElement.ValueKind == JsonValueKind.String)
+                    {
+                        string blobUrl = blobElement.GetString() ?? "";
+                        if (!string.IsNullOrEmpty(blobUrl))
+                        {
+                            using HttpClient simpleClient = new HttpClient();
+                            var blobResponse = await simpleClient.GetAsync(blobUrl);
+                            if (blobResponse.IsSuccessStatusCode)
+                            {
+                                wilcomObjectJson = await blobResponse.Content.ReadAsStringAsync();
+                                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Fetched JSON from Azure Blob.\n");
+                            }
+                            else 
+                            {
+                                File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Failed to download Blob JSON. Status: {blobResponse.StatusCode}\n");
+                            }
+                        }
+                    }
+                    else if (document.RootElement.TryGetProperty("wilcomObjectJson", out JsonElement legacyElement))
+                    {
+                        wilcomObjectJson = legacyElement.GetString() ?? "";
+                    }
+
+                    if (!string.IsNullOrEmpty(wilcomObjectJson))
+                    {
                         var exportList = JsonSerializer.Deserialize<List<ClipboardDataExport>>(wilcomObjectJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
                         
                         if (exportList != null && exportList.Any())
@@ -298,7 +468,7 @@ namespace WilcomClipboardTool
                     }
                     else
                     {
-                         File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: 'wilcomObjectJson' property missing in API response.\n");
+                         File.AppendAllText(GetLogPath("dev_trace.log"), $"{DateTime.Now}: Valid 'wilcomObjectJson' missing in both API and Blob.\n");
                     }
                 }
                 else
@@ -385,8 +555,22 @@ namespace WilcomClipboardTool
         public static List<ClipboardFormat> GetClipboardFormats()
         {
             var formats = new List<ClipboardFormat>();
-            if (!OpenClipboard(IntPtr.Zero))
+            
+            bool opened = false;
+            for (int i = 0; i < 20; i++) // Retry up to 2 seconds
+            {
+                if (OpenClipboard(IntPtr.Zero))
+                {
+                    opened = true;
+                    break;
+                }
+                System.Threading.Thread.Sleep(100);
+            }
+
+            if (!opened)
+            {
                 return formats;
+            }
 
             try
             {
@@ -438,7 +622,18 @@ namespace WilcomClipboardTool
         /// </summary>
         public static byte[]? GetClipboardDataBytes(uint formatId)
         {
-            if (!OpenClipboard(IntPtr.Zero))
+            bool opened = false;
+            for (int i = 0; i < 20; i++)
+            {
+                if (OpenClipboard(IntPtr.Zero))
+                {
+                    opened = true;
+                    break;
+                }
+                System.Threading.Thread.Sleep(100);
+            }
+
+            if (!opened)
                 return null;
 
             try

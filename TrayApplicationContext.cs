@@ -3,8 +3,9 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 
-namespace WilcomClipboardTool
+namespace SMSDesignAgent
 {
     public class TrayApplicationContext : ApplicationContext, IMessageFilter
     {
@@ -12,6 +13,8 @@ namespace WilcomClipboardTool
         private DesktopOAuthManager _oauthManager;
         private ToolStripMenuItem _statusMenuItem;
         private ToolStripMenuItem _copyCodeMenuItem;
+        private ToolStripMenuItem _checkUpdateMenuItem;
+        private ToolStripMenuItem _autoStartMenuItem;
         
         // HotKey Win32 constants
         public const int WM_HOTKEY = 0x0312;
@@ -38,6 +41,15 @@ namespace WilcomClipboardTool
             _copyCodeMenuItem = new ToolStripMenuItem("Copy Device Auth Code", null, CopyCode_Click);
             _copyCodeMenuItem.Visible = false;
 
+            _checkUpdateMenuItem = new ToolStripMenuItem("Check for updates", null, CheckUpdate_Click);
+
+            string versionStr = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "1.0.0.0";
+            var versionMenuItem = new ToolStripMenuItem($"Version {versionStr}");
+            versionMenuItem.Enabled = false;
+
+            _autoStartMenuItem = new ToolStripMenuItem("Run when Windows starts", null, AutoStart_Click);
+            _autoStartMenuItem.Checked = IsAutoStartEnabled();
+
             var exitMenuItem = new ToolStripMenuItem("Exit", null, Exit_Click);
 
             _trayIcon = new NotifyIcon()
@@ -45,11 +57,16 @@ namespace WilcomClipboardTool
                 Icon = GetEmbeddedIcon(),
                 ContextMenuStrip = new ContextMenuStrip(),
                 Visible = true,
-                Text = "Wilcom Clipboard Tool"
+                Text = "SMS Design Agent"
             };
 
             _trayIcon.ContextMenuStrip.Items.Add(_statusMenuItem);
             _trayIcon.ContextMenuStrip.Items.Add(_copyCodeMenuItem);
+            _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+            _trayIcon.ContextMenuStrip.Items.Add(_checkUpdateMenuItem);
+            _trayIcon.ContextMenuStrip.Items.Add(versionMenuItem);
+            _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
+            _trayIcon.ContextMenuStrip.Items.Add(_autoStartMenuItem);
             _trayIcon.ContextMenuStrip.Items.Add(new ToolStripSeparator());
             _trayIcon.ContextMenuStrip.Items.Add(exitMenuItem);
 
@@ -65,7 +82,7 @@ namespace WilcomClipboardTool
             try
             {
                 var assembly = System.Reflection.Assembly.GetExecutingAssembly();
-                string resourceName = System.Linq.Enumerable.FirstOrDefault(assembly.GetManifestResourceNames(), x => x.EndsWith("WilcomClipboardTool.ico", StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
+                string resourceName = System.Linq.Enumerable.FirstOrDefault(assembly.GetManifestResourceNames(), x => x.EndsWith("SMSDesignAgent.ico", StringComparison.OrdinalIgnoreCase)) ?? string.Empty;
                 if (!string.IsNullOrEmpty(resourceName))
                 {
                     var stream = assembly.GetManifestResourceStream(resourceName);
@@ -109,6 +126,61 @@ namespace WilcomClipboardTool
         {
             _trayIcon.Visible = false;
             Application.Exit();
+        }
+
+        private async void CheckUpdate_Click(object? sender, EventArgs e)
+        {
+            _checkUpdateMenuItem.Enabled = false;
+            _checkUpdateMenuItem.Text = "Checking...";
+            await UpdateManager.CheckForUpdatesAsync(true);
+            _checkUpdateMenuItem.Text = "Check for updates";
+            _checkUpdateMenuItem.Enabled = true;
+        }
+
+
+        private const string RunKeyName = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AppName = "SMSDesignAgent";
+
+        private bool IsAutoStartEnabled()
+        {
+            using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyName, false))
+            {
+                if (key != null)
+                {
+                    return key.GetValue(AppName) != null;
+                }
+            }
+            return false;
+        }
+
+        private void AutoStart_Click(object? sender, EventArgs e)
+        {
+            bool isEnabled = IsAutoStartEnabled();
+            SetAutoStart(!isEnabled);
+            _autoStartMenuItem.Checked = !isEnabled;
+        }
+
+        private void SetAutoStart(bool enable)
+        {
+            using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyName, true))
+            {
+                if (key != null)
+                {
+                    if (enable)
+                    {
+                        string exePath = Application.ExecutablePath;
+                        if (!exePath.Contains("\""))
+                        {
+                            exePath = $"\"{exePath}\""; // Quote path to handle spaces
+                        }
+                        key.SetValue(AppName, exePath);
+                    }
+                    else
+                    {
+                        key.DeleteValue(AppName, false);
+                    }
+                }
+            }
         }
 
         protected override void Dispose(bool disposing)
